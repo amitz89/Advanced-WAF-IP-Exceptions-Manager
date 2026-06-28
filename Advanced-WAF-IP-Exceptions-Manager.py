@@ -7,7 +7,7 @@ import time
 import urllib.error
 import urllib.request
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +447,13 @@ class App(tk.Tk):
         ttk.Entry(details, textvariable=self.desc_var, width=22).grid(row=2, column=1, sticky="ew")
         ttk.Label(details, text="Example: 10.0.0.0/24", style="Subtle.TLabel").grid(row=3, column=1, sticky="w", pady=(5, 0))
 
+        ttk.Label(details, text="— or —", style="Subtle.TLabel").grid(row=4, column=0, columnspan=2, pady=(10, 2))
+        self.bulk_load_btn = ttk.Button(details, text="Load IPs from File…", style="Secondary.TButton",
+                                         command=self.on_load_ip_file)
+        self.bulk_load_btn.grid(row=5, column=0, columnspan=2, sticky="ew")
+        ttk.Label(details, text="One IP/CIDR per line. Optional: 'ip,description'.", style="Subtle.TLabel").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         self.trusted_var = tk.BooleanVar(value=False)
         self.neverlog_var = tk.BooleanVar(value=False)
         self.ignoreanom_var = tk.BooleanVar(value=False)
@@ -459,7 +466,7 @@ class App(tk.Tk):
         ttk.Label(bypass, text="2. Bypass Options", style="Step.Subtle.TLabel").pack(anchor="w", pady=(0, 5))
         ttk.Checkbutton(bypass, text="Trusted by Policy Builder", variable=self.trusted_var, style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
         ttk.Checkbutton(bypass, text="Never log requests", variable=self.neverlog_var, style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
-        ttk.Checkbutton(bypass, text="Ignore anomalies", variable=self.ignoreanom_var, style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
+        ttk.Checkbutton(bypass, text="Ignore Brute Force protection", variable=self.ignoreanom_var, style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
         ttk.Checkbutton(bypass, text="Ignore IP reputation", variable=self.ignorerep_var, style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
         ttk.Checkbutton(bypass, text="Never learn requests", variable=self.neverlearn_var, style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
 
@@ -844,6 +851,120 @@ class App(tk.Tk):
         self.result_queue.put((lambda: self.delete_btn.config(state="normal", text="Delete Selected"), ()))
         self._redo_last_view()
 
+    # ---- bulk import from file -----------------------------------------
+
+    def _current_option_defaults(self):
+        """Snapshot of the main Add Exception form's current option values,
+        used to seed every IP loaded from a file before the wizard runs."""
+        return {
+            "trustedByPolicyBuilder": self.trusted_var.get(),
+            "neverLogRequests": self.neverlog_var.get(),
+            "ignoreAnomalies": self.ignoreanom_var.get(),
+            "ignoreIpReputation": self.ignorerep_var.get(),
+            "neverLearnRequests": self.neverlearn_var.get(),
+            "blockRequests": self.block_var.get(),
+        }
+
+    @staticmethod
+    def _parse_ip_list_file(path):
+        """Parse a text file of IPs/CIDRs (optionally 'ip,description' per line,
+        '#' comments and blank lines ignored). Returns (entries, errors)."""
+        entries = []
+        errors = []
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno, raw_line in enumerate(fh, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "," in line:
+                    ip_part, desc_part = line.split(",", 1)
+                    ip_part, desc_part = ip_part.strip(), desc_part.strip()
+                else:
+                    ip_part, desc_part = line, ""
+                try:
+                    ip, mask = parse_ip_input(ip_part)
+                except ValueError as e:
+                    errors.append(f"Line {lineno}: '{line}' — {e}")
+                    continue
+                entries.append({"ip": ip, "mask": mask, "description": desc_part})
+        return entries, errors
+
+    def on_load_ip_file(self):
+        path = filedialog.askopenfilename(
+            title="Select a text file with one IP/CIDR per line",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            entries, errors = self._parse_ip_list_file(path)
+        except OSError as e:
+            messagebox.showerror("Could not read file", str(e))
+            return
+
+        if not entries:
+            messagebox.showerror(
+                "No valid IPs found",
+                "No valid IP addresses were found in that file."
+                + (f"\n\n{len(errors)} line(s) could not be parsed." if errors else "")
+            )
+            return
+
+        if errors:
+            preview = "\n".join(errors[:10])
+            more = f"\n…and {len(errors) - 10} more." if len(errors) > 10 else ""
+            messagebox.showwarning(
+                "Some lines were skipped",
+                f"Loaded {len(entries)} valid IP(s). {len(errors)} line(s) could not be "
+                f"parsed and were skipped:\n\n{preview}{more}"
+            )
+
+        self.log_msg(f"Loaded {len(entries)} IP(s) from file: {path}")
+        BulkImportDialog(self, entries)
+
+    def _bulk_submit_thread(self, entries, selected, do_apply):
+        for pid, pname in selected:
+            self.result_queue.put((self.log_msg, (f"\n>>> {pname} ({pid}) — adding {len(entries)} exception(s)",)))
+            added = 0
+            for entry in entries:
+                payload = {
+                    "ipAddress": entry["ip"],
+                    "ipMask": entry["mask"],
+                    "blockRequests": entry["blockRequests"],
+                    "trustedByPolicyBuilder": entry["trustedByPolicyBuilder"],
+                    "neverLogRequests": entry["neverLogRequests"],
+                    "ignoreAnomalies": entry["ignoreAnomalies"],
+                    "ignoreIpReputation": entry["ignoreIpReputation"],
+                    "neverLearnRequests": entry["neverLearnRequests"],
+                    "description": entry.get("description", ""),
+                }
+                try:
+                    resp = self.client.add_whitelist_ip(pid, payload)
+                    added += 1
+                    self.result_queue.put((
+                        self.log_msg, (f"  + {entry['ip']}/{entry['mask']} (id: {resp.get('id', 'unknown')})",)
+                    ))
+                except F5ApiError as e:
+                    self.result_queue.put((self.log_msg, (f"  ERROR adding {entry['ip']}/{entry['mask']}: {e}",)))
+
+            self.result_queue.put((self.log_msg, (f"  {added} of {len(entries)} added to '{pname}'.",)))
+
+            if do_apply:
+                try:
+                    task_id = self.client.apply_policy(pid)
+                    self.result_queue.put((self.log_msg, (f"  Applying policy '{pname}' (task {task_id}) ...",)))
+                    self._poll_apply(task_id, pname)
+                except F5ApiError as e:
+                    self.result_queue.put((self.log_msg, (f"  ERROR applying policy '{pname}': {e}",)))
+            else:
+                self.result_queue.put((
+                    self.log_msg,
+                    (f"  Skipped apply for '{pname}' — remember to apply for changes to take effect.",)
+                ))
+
+        self.last_view = {"mode": "browse", "selected": selected}
+        self._refresh_whitelist_thread(selected)
+
     def on_submit(self):
         if not self.client:
             messagebox.showwarning("Not connected", "Connect to a BIG-IP first.")
@@ -932,6 +1053,251 @@ class App(tk.Tk):
                 self.result_queue.put((self.log_msg, (f"  Policy '{pname}' apply FAILED.",)))
                 return
             time.sleep(2)
+
+
+class BulkImportDialog(tk.Toplevel):
+    """Step-by-step wizard for a list of IPs loaded from a file.
+
+    Walks through each IP one at a time asking what to do with it (pre-filled
+    with the main form's current settings), with a shortcut to apply the same
+    bypass/block settings to every IP in the list instead of stepping through
+    each one individually. Ends on a review screen before anything is sent.
+    """
+
+    def __init__(self, app: "App", entries):
+        super().__init__(app)
+        self.app = app
+        self.entries = entries
+        self.index = 0
+
+        defaults = app._current_option_defaults()
+        for entry in self.entries:
+            for key, value in defaults.items():
+                entry.setdefault(key, value)
+
+        self.title(f"Bulk Import — {len(entries)} IP(s)")
+        self.geometry("640x580")
+        self.minsize(580, 500)
+        self.configure(bg=app.BG)
+        self.transient(app)
+        self.grab_set()
+
+        self.desc_var = tk.StringVar()
+        self.trusted_var = tk.BooleanVar()
+        self.neverlog_var = tk.BooleanVar()
+        self.ignoreanom_var = tk.BooleanVar()
+        self.ignorerep_var = tk.BooleanVar()
+        self.neverlearn_var = tk.BooleanVar()
+        self.block_var = tk.StringVar()
+        self.apply_after_var = tk.BooleanVar(value=True)
+
+        self.body = ttk.Frame(self, style="Shell.TFrame", padding=16)
+        self.body.pack(fill="both", expand=True)
+        self.body.columnconfigure(0, weight=1)
+        self.body.rowconfigure(1, weight=1)
+
+        self._build_step_view()
+        self._show_entry(0)
+
+    # ---- per-IP step view ------------------------------------------
+
+    def _build_step_view(self):
+        for child in self.body.winfo_children():
+            child.destroy()
+
+        header = ttk.Frame(self.body, style="Shell.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        header.columnconfigure(0, weight=1)
+        self.progress_label = ttk.Label(header, text="", style="Section.TLabel")
+        self.progress_label.grid(row=0, column=0, sticky="w")
+        target_names = ", ".join(n for _, n in self.app.get_selected_policies()) or "(none selected yet)"
+        ttk.Label(header, text=f"Target polic(ies): {target_names}", style="Hint.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(2, 0))
+
+        card = ttk.Frame(self.body, style="Card.TFrame", padding=16)
+        card.grid(row=1, column=0, sticky="nsew")
+        card.columnconfigure(1, weight=1)
+
+        self.ip_label = ttk.Label(card, text="", style="Step.TLabel")
+        self.ip_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(card, text="Description", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(card, textvariable=self.desc_var).grid(row=1, column=1, sticky="ew", pady=(0, 10))
+
+        bypass = ttk.Frame(card, style="Subtle.TFrame", padding=(12, 10))
+        bypass.grid(row=2, column=0, sticky="nsew", padx=(0, 6), pady=(0, 10))
+        ttk.Label(bypass, text="Bypass Options", style="Step.Subtle.TLabel").pack(anchor="w", pady=(0, 5))
+        ttk.Checkbutton(bypass, text="Trusted by Policy Builder", variable=self.trusted_var,
+                         style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
+        ttk.Checkbutton(bypass, text="Never log requests", variable=self.neverlog_var,
+                         style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
+        ttk.Checkbutton(bypass, text="Ignore anomalies", variable=self.ignoreanom_var,
+                         style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
+        ttk.Checkbutton(bypass, text="Ignore IP reputation", variable=self.ignorerep_var,
+                         style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
+        ttk.Checkbutton(bypass, text="Never learn requests", variable=self.neverlearn_var,
+                         style="Subtle.TCheckbutton").pack(anchor="w", pady=1)
+
+        block = ttk.Frame(card, style="Subtle.TFrame", padding=(12, 10))
+        block.grid(row=2, column=1, sticky="nsew", padx=(6, 0), pady=(0, 10))
+        ttk.Label(block, text="Block Behavior", style="Step.Subtle.TLabel").pack(anchor="w", pady=(0, 5))
+        ttk.Radiobutton(block, text="Policy default", variable=self.block_var, value="policy-default",
+                        style="Subtle.TRadiobutton").pack(anchor="w", pady=1)
+        ttk.Radiobutton(block, text="Never block this IP", variable=self.block_var, value="never",
+                        style="Subtle.TRadiobutton").pack(anchor="w", pady=1)
+        ttk.Radiobutton(block, text="Always block this IP", variable=self.block_var, value="always",
+                        style="Subtle.TRadiobutton").pack(anchor="w", pady=1)
+
+        ttk.Button(card, text="Apply these settings to ALL IPs in the list ▸", style="Primary.TButton",
+                   command=self.on_apply_to_all).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        ttk.Label(
+            card,
+            text="Skips the per-IP walkthrough — uses the bypass/block settings above for every "
+                 "IP (descriptions stay as loaded from the file).",
+            style="Hint.TLabel"
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        nav = ttk.Frame(self.body, style="Shell.TFrame")
+        nav.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        nav.columnconfigure(1, weight=1)
+        ttk.Button(nav, text="Cancel", style="Secondary.TButton", command=self.destroy).grid(row=0, column=0, sticky="w")
+        self.back_btn = ttk.Button(nav, text="◂ Back", style="Secondary.TButton", command=self.on_back)
+        self.back_btn.grid(row=0, column=2, sticky="e", padx=(0, 8))
+        self.next_btn = ttk.Button(nav, text="Next ▸", style="Primary.TButton", command=self.on_next)
+        self.next_btn.grid(row=0, column=3, sticky="e")
+
+    def _show_entry(self, idx):
+        self.index = idx
+        entry = self.entries[idx]
+        self.progress_label.config(text=f"IP {idx + 1} of {len(self.entries)}")
+        self.ip_label.config(text=f"{entry['ip']} / {entry['mask']}")
+        self.desc_var.set(entry.get("description", ""))
+        self.trusted_var.set(entry["trustedByPolicyBuilder"])
+        self.neverlog_var.set(entry["neverLogRequests"])
+        self.ignoreanom_var.set(entry["ignoreAnomalies"])
+        self.ignorerep_var.set(entry["ignoreIpReputation"])
+        self.neverlearn_var.set(entry["neverLearnRequests"])
+        self.block_var.set(entry["blockRequests"])
+        self.back_btn.config(state="normal" if idx > 0 else "disabled")
+        self.next_btn.config(text="Review & Submit ▸" if idx == len(self.entries) - 1 else "Next ▸")
+
+    def _save_current(self):
+        entry = self.entries[self.index]
+        entry["description"] = self.desc_var.get().strip()
+        entry["trustedByPolicyBuilder"] = self.trusted_var.get()
+        entry["neverLogRequests"] = self.neverlog_var.get()
+        entry["ignoreAnomalies"] = self.ignoreanom_var.get()
+        entry["ignoreIpReputation"] = self.ignorerep_var.get()
+        entry["neverLearnRequests"] = self.neverlearn_var.get()
+        entry["blockRequests"] = self.block_var.get()
+
+    def on_next(self):
+        self._save_current()
+        if self.index == len(self.entries) - 1:
+            self._build_review_view()
+        else:
+            self._show_entry(self.index + 1)
+
+    def on_back(self):
+        self._save_current()
+        if self.index > 0:
+            self._show_entry(self.index - 1)
+
+    def on_apply_to_all(self):
+        self._save_current()
+        current = self.entries[self.index]
+        shared_keys = ("trustedByPolicyBuilder", "neverLogRequests", "ignoreAnomalies",
+                       "ignoreIpReputation", "neverLearnRequests", "blockRequests")
+        shared_values = {k: current[k] for k in shared_keys}
+        for entry in self.entries:
+            entry.update(shared_values)
+        self._build_review_view()
+
+    # ---- review / submit -------------------------------------------
+
+    def _build_review_view(self):
+        for child in self.body.winfo_children():
+            child.destroy()
+
+        header = ttk.Frame(self.body, style="Shell.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text=f"Review — {len(self.entries)} IP(s)", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w")
+        target_names = ", ".join(n for _, n in self.app.get_selected_policies()) or "(none — go select a policy first)"
+        ttk.Label(header, text=f"Will be added to: {target_names}", style="Hint.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(2, 0))
+
+        table_frame = ttk.Frame(self.body, style="Card.TFrame", padding=10)
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        columns = ("ip", "mask", "block", "trustedPB", "neverLog", "ignoreAnom", "ignoreRep", "neverLearn", "description")
+        headings = {
+            "ip": "IP Address", "mask": "Mask", "block": "Block", "trustedPB": "Trusted",
+            "neverLog": "Never Log", "ignoreAnom": "Ignore Anom", "ignoreRep": "Ignore Rep",
+            "neverLearn": "Never Learn", "description": "Description",
+        }
+        widths = {"ip": 110, "mask": 110, "block": 95, "trustedPB": 70, "neverLog": 80,
+                  "ignoreAnom": 85, "ignoreRep": 80, "neverLearn": 85, "description": 160}
+
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
+        for col in columns:
+            tree.heading(col, text=headings[col])
+            tree.column(col, width=widths[col], anchor="w" if col in ("ip", "mask", "description") else "center")
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        tree.config(yscrollcommand=scroll.set)
+
+        for entry in self.entries:
+            tree.insert("", "end", values=(
+                entry["ip"], entry["mask"], entry["blockRequests"],
+                "Yes" if entry["trustedByPolicyBuilder"] else "No",
+                "Yes" if entry["neverLogRequests"] else "No",
+                "Yes" if entry["ignoreAnomalies"] else "No",
+                "Yes" if entry["ignoreIpReputation"] else "No",
+                "Yes" if entry["neverLearnRequests"] else "No",
+                entry.get("description", ""),
+            ))
+
+        footer = ttk.Frame(self.body, style="Shell.TFrame")
+        footer.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        footer.columnconfigure(1, weight=1)
+        ttk.Checkbutton(footer, text="Apply policy after adding", variable=self.apply_after_var).grid(
+            row=0, column=0, sticky="w")
+        ttk.Button(footer, text="◂ Back to Edit", style="Secondary.TButton",
+                   command=self._back_to_edit).grid(row=0, column=2, sticky="e", padx=(0, 8))
+        ttk.Button(footer, text=f"Submit {len(self.entries)} IP(s)", style="Primary.TButton",
+                   command=self.on_submit_all).grid(row=0, column=3, sticky="e")
+
+    def _back_to_edit(self):
+        self._build_step_view()
+        self._show_entry(min(self.index, len(self.entries) - 1))
+
+    def on_submit_all(self):
+        selected = self.app.get_selected_policies()
+        if not selected:
+            messagebox.showwarning(
+                "No policy selected",
+                "Go to the Policy Lookup tab and select at least one policy first.",
+                parent=self,
+            )
+            return
+        summary = (
+            f"Add {len(self.entries)} IP(s) to {len(selected)} polic(ies):\n"
+            + "\n".join(f"  - {n}" for _, n in selected)
+            + f"\n\nApply policy after adding: {self.apply_after_var.get()}\n\nProceed?"
+        )
+        if not messagebox.askyesno("Confirm bulk import", summary, parent=self):
+            return
+
+        entries_copy = [dict(e) for e in self.entries]
+        do_apply = self.apply_after_var.get()
+        self.app.log_msg(f"Bulk import started: {len(entries_copy)} IP(s) -> {len(selected)} polic(ies).")
+        self.app.run_async(self.app._bulk_submit_thread, entries_copy, selected, do_apply)
+        self.destroy()
 
 
 if __name__ == "__main__":
